@@ -64,6 +64,8 @@ pub struct ProcessingContext {
     pub parsed_block_nesting: usize,
     /// Command associated with each label
     pub label_to_command_map: HashMap<String, Rc<RefCell<Command>>>,
+    /// Commands with a (latchable and resetable) address range
+    pub range_commands: Vec<Rc<RefCell<Command>>>,
     /// True if a substitution was made as specified in the t command
     pub substitution_made: bool,
     /// Elements to append at the end of each command processing cycle
@@ -84,26 +86,15 @@ pub struct StringSpace {
     pub has_newline: bool, // True if \n-terminated
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 /// Types of address specifications that precede commands
-pub enum AddressType {
-    Re,      // Line that matches regex
-    Line,    // Specific line
-    RelLine, // Relative line
-    Last,    // Last line
-}
-
-#[derive(Debug)]
-/// Format of an address
-pub struct Address {
-    pub atype: AddressType,  // Address type
-    pub value: AddressValue, // Line number or regex
-}
-
-#[derive(Debug)]
-pub enum AddressValue {
-    LineNumber(usize),
-    Regex(Option<Regex>),
+pub enum Address {
+    Re(Option<Regex>), // Line that matches (optional) regex
+    Line(usize),       // Specific line
+    RelLine(usize),    // Relative line
+    Last,              // Last line
+    StepMatch(usize),  // Lines matching specified step from first
+    StepEnd(usize),    // Range ending at specified step from first
 }
 
 #[derive(Debug)]
@@ -278,7 +269,7 @@ pub struct Command {
     pub addr1: Option<Address>,             // Start address
     pub addr2: Option<Address>,             // End address
     pub non_select: bool,                   // True if '!'
-    pub start_line: Option<usize>,          // Start line number (or None)
+    pub start_line: Option<usize>,          // Start line number (or None if unlatched)
     pub data: CommandData,                  // Command-specific data
     pub next: Option<Rc<RefCell<Command>>>, // Pointer to next command
     pub location: ScriptLocation,           // Command's definition location

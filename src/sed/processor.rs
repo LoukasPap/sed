@@ -9,8 +9,7 @@
 // file that was distributed with this source code.
 
 use crate::sed::command::{
-    Address, AddressType, AddressValue, AppendElement, Command, CommandData, InputAction,
-    ProcessingContext, Transliteration,
+    Address, AppendElement, Command, CommandData, InputAction, ProcessingContext, Transliteration,
 };
 use crate::sed::error_handling::{ScriptLocation, input_runtime_error};
 use crate::sed::fast_io::{IOChunk, LineReader, OutputBuffer};
@@ -40,30 +39,21 @@ macro_rules! extract_variant {
 /// Return true if the passed address matches the current I/O context.
 fn match_address(
     addr: &Address,
+    reader: &mut LineReader,
     pattern: &mut IOChunk,
     context: &mut ProcessingContext,
     location: &ScriptLocation,
 ) -> UResult<bool> {
-    match addr.atype {
-        AddressType::Re => {
-            if let AddressValue::Regex(ref re) = addr.value {
-                let regex = re_or_saved_re(re, context, location)?;
-                match regex.is_match(pattern) {
-                    Ok(result) => Ok(result),
-                    Err(e) => input_runtime_error(location, context, e.to_string()),
-                }
-            } else {
-                Ok(false)
+    match addr {
+        Address::Re(re) => {
+            let regex = re_or_saved_re(re, context, location)?;
+            match regex.is_match(pattern) {
+                Ok(result) => Ok(result),
+                Err(e) => input_runtime_error(location, context, e.to_string()),
             }
         }
 
-        AddressType::Line => {
-            if let AddressValue::LineNumber(lineno) = addr.value {
-                Ok(context.line_number == lineno)
-            } else {
-                Ok(false)
-            }
-        }
+        Address::Line(lineno) => Ok(context.line_number == *lineno),
 
         // Recognize "$" as the last line of last file. This is consistent
         // with the original 7th Research Edition implementation:
@@ -71,7 +61,7 @@ fn match_address(
         // The FreeBSD version checked for subsequent empty files, but this
         // can lead to destructive reads (e.g. from named pipes),
         // and is probably an overkill.
-        AddressType::Last => Ok(context.last_line && (context.last_file || context.separate)),
+        Address::Last => Ok(reader.last_line()? && (context.last_file || context.separate)),
 
         _ => panic!("invalid address type in match_address"),
     }
@@ -81,63 +71,66 @@ fn match_address(
 /// Return true if the command applies to the given pattern.
 fn applies(
     command: &mut Command,
+    reader: &mut LineReader,
     pattern: &mut IOChunk,
     context: &mut ProcessingContext,
 ) -> UResult<bool> {
     let linenum = context.line_number;
 
     let result = if command.addr1.is_none() && command.addr2.is_none() {
+        // No address
         Ok(true)
     } else if let Some(addr2) = &command.addr2 {
+        // Two addresses
         if let Some(start) = command.start_line {
-            match addr2.atype {
-                AddressType::RelLine => {
-                    if let AddressValue::LineNumber(n) = addr2.value {
-                        if linenum - start <= n {
-                            Ok(true)
-                        } else {
-                            command.start_line = None;
-                            Ok(false)
-                        }
-                    } else {
+            // Range is already latched active.
+            match addr2 {
+                Address::RelLine(n) => {
+                    if linenum - start > *n {
+                        command.start_line = None;
                         Ok(false)
+                    } else {
+                        Ok(true)
                     }
                 }
-                _ => {
-                    if match_address(addr2, pattern, context, &command.location)? {
+                Address::Line(n) => {
+                    // Special case: already ended
+                    if linenum > *n {
                         command.start_line = None;
-                        context.last_address = true;
-                        Ok(true)
-                    } else if addr2.atype == AddressType::Line {
-                        if let AddressValue::LineNumber(n) = addr2.value {
-                            if linenum > n {
-                                command.start_line = None;
-                                Ok(false)
-                            } else {
-                                Ok(true)
-                            }
-                        } else {
-                            Ok(true)
-                        }
+                        Ok(false)
                     } else {
                         Ok(true)
                     }
+                }
+                Address::StepMatch(step) => Ok((linenum - start).is_multiple_of(*step)),
+                Address::StepEnd(step) => {
+                    // Inclusive end on multiple of step
+                    if linenum.is_multiple_of(*step) {
+                        command.start_line = None;
+                    }
+                    Ok(true)
+                }
+                _ => {
+                    if match_address(addr2, reader, pattern, context, &command.location)? {
+                        command.start_line = None;
+                        context.last_address = true;
+                    }
+                    Ok(true)
                 }
             }
         } else if let Some(addr1) = &command.addr1 {
-            if match_address(addr1, pattern, context, &command.location)? {
-                match addr2.atype {
-                    AddressType::Line => {
-                        if let AddressValue::LineNumber(n) = addr2.value {
-                            if linenum >= n {
-                                context.last_address = true;
-                            } else {
-                                command.start_line = Some(linenum);
-                            }
+            // See if latch must start.
+            if match_address(addr1, reader, pattern, context, &command.location)? {
+                match addr2 {
+                    Address::Line(n) => {
+                        if linenum >= *n {
+                            context.last_address = true;
+                        } else {
+                            command.start_line = Some(linenum);
                         }
                     }
-                    AddressType::RelLine => {
-                        if let AddressValue::LineNumber(0) = addr2.value {
+                    Address::RelLine(n) => {
+                        if *n == 0 {
                             context.last_address = true;
                         } else {
                             command.start_line = Some(linenum);
@@ -155,9 +148,17 @@ fn applies(
             Ok(false)
         }
     } else if let Some(addr1) = &command.addr1 {
-        Ok(match_address(addr1, pattern, context, &command.location)?)
+        // Single address
+        Ok(match_address(
+            addr1,
+            reader,
+            pattern,
+            context,
+            &command.location,
+        )?)
     } else {
-        Ok(false)
+        // All allowed cases have been covered by the above logic.
+        panic!("impossible address combination");
     };
 
     if command.non_select {
@@ -434,8 +435,7 @@ fn process_file(
     context.hold.content = String::from("\n");
 
     // Loop over the input lines as pattern space.
-    'lines: while let Some((mut pattern, last_line)) = reader.get_line()? {
-        context.last_line = last_line;
+    'lines: while let Some(mut pattern) = reader.get_line()? {
         context.line_number += 1;
         context.substitution_made = false;
         // Set the script command from which to start.
@@ -458,7 +458,7 @@ fn process_file(
         while let Some(command_rc) = current.clone() {
             let mut command = command_rc.borrow_mut();
 
-            if !applies(&mut command, &mut pattern, context)? {
+            if !applies(&mut command, reader, &mut pattern, context)? {
                 // Advance to next command
                 current = command.next.clone();
                 continue;
@@ -497,7 +497,7 @@ fn process_file(
                     // At range end replace pattern space with text and
                     // start the next cycle.
                     pattern.clear();
-                    if command.addr2.is_none() || context.last_address || context.last_line {
+                    if command.addr2.is_none() || context.last_address || reader.last_line()? {
                         let text = extract_variant!(command, Text);
                         output.write_str(text.as_ref())?;
                     }
@@ -682,6 +682,21 @@ fn process_file(
     Ok(())
 }
 
+/// Mark all address ranges non-active (and 0-starting ones as active).
+fn reset_latched_address_ranges(range_commands: &mut [Rc<RefCell<Command>>]) {
+    for cmd_rc in range_commands.iter() {
+        let mut cmd = cmd_rc.borrow_mut();
+
+        cmd.start_line =
+            // Check for address-spec line 0 pre-latch extension.
+            if let Some(addr1) = &cmd.addr1 && matches!(addr1, Address::Line(0)) {
+                Some(0)
+            } else {
+                None
+            };
+    }
+}
+
 /// Process all input files
 pub fn process_all_files(
     commands: Option<Rc<RefCell<Command>>>,
@@ -699,9 +714,11 @@ pub fn process_all_files(
             .map_err_context(|| format!("error opening input file {}", path.quote()))?;
         let output = in_place.begin(path)?;
 
-        if context.separate {
+        if index == 0 || context.separate {
             context.line_number = 0;
+            reset_latched_address_ranges(&mut context.range_commands);
         }
+
         context.input_name = path.quote().to_string();
         process_file(&commands, &mut reader, output, context)?;
 

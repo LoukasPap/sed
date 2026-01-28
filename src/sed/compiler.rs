@@ -9,8 +9,8 @@
 // file that was distributed with this source code.
 
 use crate::sed::command::{
-    Address, AddressType, AddressValue, Command, CommandData, ProcessingContext, ReplacementPart,
-    ReplacementTemplate, Substitution, Transliteration,
+    Address, Command, CommandData, ProcessingContext, ReplacementPart, ReplacementTemplate,
+    Substitution, Transliteration,
 };
 use crate::sed::delimited_parser::{parse_char_escape, parse_regex, parse_transliteration};
 use crate::sed::error_handling::{ScriptLocation, compilation_error, semantic_error};
@@ -68,11 +68,12 @@ pub fn compile(
 
     // Link branch commands to the target label commands.
     populate_label_map(result.clone(), context)?;
+    populate_range_commands(result.clone(), context);
     resolve_branch_targets(result.clone(), context)?;
 
     // Link the ends of command blocks to their following commands.
     // This converts the tree into a graph, so it must be the last
-    // conversion than traverses the structure as a tree.
+    // conversion that traverses the structure as a tree.
     if context.parsed_block_nesting > 0 {
         return Err(USimpleError::new(1, "unmatched `{'"));
     }
@@ -165,6 +166,26 @@ fn populate_label_map(
         cur = cmd.next.clone();
     }
     Ok(())
+}
+
+/// Populate the context's address range command list with references to associated commands.
+fn populate_range_commands(mut cur: Option<Rc<RefCell<Command>>>, context: &mut ProcessingContext) {
+    while let Some(rc_cmd) = cur {
+        // Borrow mutably just long enough to inspect/rewire this node
+        let cmd = rc_cmd.borrow_mut();
+
+        // Recursively process blocks.
+        if let CommandData::BranchTarget(Some(sub_head)) = &cmd.data {
+            populate_range_commands(Some(Rc::clone(sub_head)), context);
+        }
+
+        if cmd.addr2.is_some() {
+            // Save detected range command.
+            context.range_commands.push(Rc::clone(&rc_cmd));
+        }
+
+        cur = cmd.next.clone();
+    }
 }
 
 /// Replace branch labels with references to the corresponding commands.
@@ -307,25 +328,83 @@ fn compile_address_range(
     let mut n_addr = 0;
     let mut cmd = cmd.borrow_mut();
 
+    let mut is_line0 = false;
+
     line.eat_spaces();
     if !line.eol()
         && is_address_char(line.current())
         && let Ok(addr1) = compile_address(lines, line, context)
     {
+        is_line0 = matches!(addr1, Address::Line(0));
         cmd.addr1 = Some(addr1);
+        if is_line0 && context.posix {
+            // 0 starting address is a GNU extension.
+            return compilation_error(lines, line, "address 0 is invalid in POSIX mode");
+        }
         n_addr += 1;
     }
 
     line.eat_spaces();
-    if n_addr == 1 && !line.eol() && line.current() == ',' {
+    if n_addr == 1 && !line.eol() && matches!(line.current(), ',' | '~') {
+        let is_step_match = line.current() == '~'; // E.g. 0~2: Pick even-numbered lines
         line.advance();
         line.eat_spaces();
+        let is_step_end = if line.current() == '~' {
+            // E.g. /foo/,~10: Start at foo, include all lines until multiple of 10 is reached.
+            line.advance();
+            line.eat_spaces();
+            true
+        } else {
+            false
+        };
+
+        if (is_step_match || is_step_end) && context.posix {
+            // ~ steps are a GNU extension.
+            return compilation_error(lines, line, "~step is invalid in POSIX mode");
+        }
+
+        // Look for second address.
         if !line.eol()
             && let Ok(addr2) = compile_address(lines, line, context)
         {
-            cmd.addr2 = Some(addr2);
+            // Set step_n to the number specified in the (required numeric) address.
+            let step_n = if is_step_match || is_step_end {
+                match addr2 {
+                    Address::Line(n) => n,
+                    _ => {
+                        return compilation_error(
+                            lines,
+                            line,
+                            "~step can only be specified on numeric addresses",
+                        );
+                    }
+                }
+            } else {
+                0 // dummy, not used
+            };
+
+            if is_line0 && !matches!(addr2, Address::Re(_)) && !is_step_match {
+                return compilation_error(
+                    lines,
+                    line,
+                    "address 0 can only be used with a regular expression or ~step",
+                );
+            }
+
+            // If needed, transform Address::Line into Address::Step*.
+            cmd.addr2 = if is_step_match {
+                Some(Address::StepMatch(step_n))
+            } else if is_step_end {
+                Some(Address::StepEnd(step_n))
+            } else {
+                Some(addr2)
+            };
             n_addr += 1;
         }
+    }
+
+    if is_line0 && n_addr == 1 {
+        return compilation_error(lines, line, "address 0 requires a second address");
     }
 
     Ok(n_addr)
@@ -350,6 +429,8 @@ fn read_file_path(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> 
 }
 
 /// Compile and return a single range address specification.
+// Due to their irregular syntax ~ addresses are returned as Line() and adjusted
+// in compile_address_range().
 fn compile_address(
     lines: &ScriptLineProvider,
     line: &mut ScriptCharProvider,
@@ -378,32 +459,22 @@ fn compile_address(
                 line.advance();
             }
 
-            Ok(Address {
-                atype: AddressType::Re,
-                value: AddressValue::Regex(compile_regex(lines, line, &re, context, icase)?),
-            })
+            Ok(Address::Re(compile_regex(
+                lines, line, &re, context, icase,
+            )?))
         }
         '$' => {
             line.advance();
-            Ok(Address {
-                atype: AddressType::Last,
-                value: AddressValue::LineNumber(0),
-            })
+            Ok(Address::Last)
         }
         '+' => {
             line.advance();
             let number = parse_number(lines, line, true)?.unwrap();
-            Ok(Address {
-                atype: AddressType::RelLine,
-                value: AddressValue::LineNumber(number),
-            })
+            Ok(Address::RelLine(number))
         }
         c if c.is_ascii_digit() => {
             let number = parse_number(lines, line, true)?.unwrap();
-            Ok(Address {
-                atype: AddressType::Line,
-                value: AddressValue::LineNumber(number),
-            })
+            Ok(Address::Line(number))
         }
         _ => panic!("invalid context address"),
     }
@@ -1490,54 +1561,45 @@ mod tests {
     fn test_compile_addr_line_number() {
         let (lines, mut chars) = make_providers("42");
         let addr = compile_address(&lines, &mut chars, &ctx()).unwrap();
-        assert!(matches!(addr.atype, AddressType::Line));
-        if let AddressValue::LineNumber(n) = addr.value {
-            assert_eq!(n, 42);
-        } else {
-            panic!("expected LineNumber address value");
-        }
+        assert!(matches!(addr, Address::Line(42)));
     }
 
     #[test]
     fn test_compile_addr_relative_line() {
         let (lines, mut chars) = make_providers("+7");
         let addr = compile_address(&lines, &mut chars, &ctx()).unwrap();
-        assert!(matches!(addr.atype, AddressType::RelLine));
-        if let AddressValue::LineNumber(n) = addr.value {
-            assert_eq!(n, 7);
-        } else {
-            panic!("expected LineNumber address value");
-        }
+        assert!(matches!(addr, Address::RelLine(7)));
     }
 
     #[test]
     fn test_compile_addr_last_line() {
         let (lines, mut chars) = make_providers("$");
         let addr = compile_address(&lines, &mut chars, &ctx()).unwrap();
-        assert!(matches!(addr.atype, AddressType::Last));
+        assert!(matches!(addr, Address::Last));
     }
 
     #[test]
     fn test_compile_addr_regex() {
         let (lines, mut chars) = make_providers("/hello/");
         let addr = compile_address(&lines, &mut chars, &ctx()).unwrap();
-        assert!(matches!(addr.atype, AddressType::Re));
-        if let AddressValue::Regex(Some(re)) = addr.value {
-            assert!(re.is_match(&mut IOChunk::new_from_str("hello")).unwrap());
-        } else {
-            panic!("expected Regex address value");
-        }
+
+        let Address::Re(Some(re)) = addr else {
+            panic!("expected Address::Re(Some(_))");
+        };
+
+        assert!(re.is_match(&mut IOChunk::new_from_str("hello")).unwrap());
     }
 
     #[test]
     fn test_compile_addr_regex_backref_match() {
         let (lines, mut chars) = make_providers(r"/he\(.\)\1o/");
         let addr = compile_address(&lines, &mut chars, &ctx()).unwrap();
-        assert!(matches!(addr.atype, AddressType::Re));
-        if let AddressValue::Regex(Some(re)) = addr.value {
-            assert!(re.is_match(&mut IOChunk::new_from_str("hello")).unwrap());
-        } else {
-            panic!("expected Regex address value");
+
+        match addr {
+            Address::Re(Some(re)) => {
+                assert!(re.is_match(&mut IOChunk::new_from_str("hello")).unwrap());
+            }
+            _ => panic!("expected Address::Re(Some(_))"),
         }
     }
 
@@ -1545,11 +1607,12 @@ mod tests {
     fn test_compile_addr_regex_backref_no_match() {
         let (lines, mut chars) = make_providers(r"/he\(.\)\1o/");
         let addr = compile_address(&lines, &mut chars, &ctx()).unwrap();
-        assert!(matches!(addr.atype, AddressType::Re));
-        if let AddressValue::Regex(Some(re)) = addr.value {
-            assert!(!re.is_match(&mut IOChunk::new_from_str("helio")).unwrap());
-        } else {
-            panic!("expected Regex address value");
+
+        match addr {
+            Address::Re(Some(re)) => {
+                assert!(!re.is_match(&mut IOChunk::new_from_str("helio")).unwrap());
+            }
+            _ => panic!("expected Address::Re(Some(_))"),
         }
     }
 
@@ -1557,11 +1620,12 @@ mod tests {
     fn test_compile_addr_regex_other_delimiter() {
         let (lines, mut chars) = make_providers("\\#hello#");
         let addr = compile_address(&lines, &mut chars, &ctx()).unwrap();
-        assert!(matches!(addr.atype, AddressType::Re));
-        if let AddressValue::Regex(Some(re)) = addr.value {
-            assert!(re.is_match(&mut IOChunk::new_from_str("hello")).unwrap());
-        } else {
-            panic!("expected Regex address value");
+
+        match addr {
+            Address::Re(Some(re)) => {
+                assert!(re.is_match(&mut IOChunk::new_from_str("hello")).unwrap());
+            }
+            _ => panic!("expected Address::Re(Some(_))"),
         }
     }
 
@@ -1569,11 +1633,13 @@ mod tests {
     fn test_compile_addr_regex_with_modifier() {
         let (lines, mut chars) = make_providers("/hello/I");
         let addr = compile_address(&lines, &mut chars, &ctx()).unwrap();
-        assert!(matches!(addr.atype, AddressType::Re));
-        if let AddressValue::Regex(Some(re)) = addr.value {
-            assert!(re.is_match(&mut IOChunk::new_from_str("HELLO")).unwrap()); // case-insensitive
-        } else {
-            panic!("expected Regex address value");
+
+        match addr {
+            Address::Re(Some(re)) => {
+                // Case-insensitive
+                assert!(re.is_match(&mut IOChunk::new_from_str("HELLO")).unwrap());
+            }
+            _ => panic!("expected Address::Re(Some(_))"),
         }
     }
 
@@ -1585,10 +1651,7 @@ mod tests {
         let n_addr = compile_address_range(&lines, &mut chars, &mut cmd, &ctx()).unwrap();
 
         assert_eq!(n_addr, 1);
-        assert!(matches!(
-            cmd.borrow().addr1.as_ref().unwrap().atype,
-            AddressType::Line
-        ));
+        assert!(matches!(cmd.borrow().addr1, Some(Address::Line(42))));
     }
 
     #[test]
@@ -1599,25 +1662,30 @@ mod tests {
 
         assert_eq!(n_addr, 2);
 
-        assert!(matches!(
-            cmd.borrow().addr1.as_ref().unwrap().atype,
-            AddressType::Line
-        ));
-        let v1 = match &cmd.borrow().addr1.as_ref().unwrap().value {
-            AddressValue::LineNumber(n) => *n,
-            _ => panic!(),
-        };
-        assert_eq!(v1, 2);
+        assert!(matches!(cmd.borrow().addr1, Some(Address::Line(2))));
+        assert!(matches!(cmd.borrow().addr2, Some(Address::RelLine(3))));
+    }
 
-        assert!(matches!(
-            cmd.borrow().addr2.as_ref().unwrap().atype,
-            AddressType::RelLine
-        ));
-        let v2 = match &cmd.borrow().addr2.as_ref().unwrap().value {
-            AddressValue::LineNumber(n) => *n,
-            _ => panic!(),
-        };
-        assert_eq!(v2, 3);
+    #[test]
+    fn test_compile_step_match_address() {
+        let (lines, mut chars) = make_providers("0~2");
+        let mut cmd = Rc::new(RefCell::new(Command::default()));
+        let n_addr = compile_address_range(&lines, &mut chars, &mut cmd, &ctx()).unwrap();
+
+        assert_eq!(n_addr, 2);
+        assert!(matches!(cmd.borrow().addr1, Some(Address::Line(0))));
+        assert!(matches!(cmd.borrow().addr2, Some(Address::StepMatch(2))));
+    }
+
+    #[test]
+    fn test_compile_step_end_address() {
+        let (lines, mut chars) = make_providers("1,~10");
+        let mut cmd = Rc::new(RefCell::new(Command::default()));
+        let n_addr = compile_address_range(&lines, &mut chars, &mut cmd, &ctx()).unwrap();
+
+        assert_eq!(n_addr, 2);
+        assert!(matches!(cmd.borrow().addr1, Some(Address::Line(1))));
+        assert!(matches!(cmd.borrow().addr2, Some(Address::StepEnd(10))));
     }
 
     #[test]
@@ -1627,10 +1695,7 @@ mod tests {
         let n_addr = compile_address_range(&lines, &mut chars, &mut cmd, &ctx()).unwrap();
 
         assert_eq!(n_addr, 1);
-        assert!(matches!(
-            cmd.borrow().addr1.as_ref().unwrap().atype,
-            AddressType::Last
-        ));
+        assert!(matches!(cmd.borrow().addr1, Some(Address::Last)));
     }
 
     #[test]
@@ -1640,14 +1705,8 @@ mod tests {
         let n_addr = compile_address_range(&lines, &mut chars, &mut cmd, &ctx()).unwrap();
 
         assert_eq!(n_addr, 2);
-        assert!(matches!(
-            cmd.borrow().addr1.as_ref().unwrap().atype,
-            AddressType::Line
-        ));
-        assert!(matches!(
-            cmd.borrow().addr2.as_ref().unwrap().atype,
-            AddressType::Line
-        ));
+        assert!(matches!(cmd.borrow().addr1, Some(Address::Line(5))));
+        assert!(matches!(cmd.borrow().addr2, Some(Address::Line(10))));
     }
 
     #[test]
@@ -1657,16 +1716,14 @@ mod tests {
         let n_addr = compile_address_range(&lines, &mut chars, &mut cmd, &ctx()).unwrap();
 
         assert_eq!(n_addr, 1);
-        assert!(matches!(
-            cmd.borrow().addr1.as_ref().unwrap().atype,
-            AddressType::Re
-        ));
-        if let AddressValue::Regex(Some(re)) = &cmd.borrow().addr1.as_ref().unwrap().value {
-            assert!(re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
-            assert!(!re.is_match(&mut IOChunk::new_from_str("bar")).unwrap());
-        } else {
-            panic!("expected a regex address");
-        };
+
+        match cmd.borrow().addr1.as_ref().unwrap() {
+            Address::Re(Some(re)) => {
+                assert!(re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
+                assert!(!re.is_match(&mut IOChunk::new_from_str("bar")).unwrap());
+            }
+            _ => panic!("expected regex address"),
+        }
     }
 
     #[test]
@@ -1677,27 +1734,21 @@ mod tests {
 
         assert_eq!(n_addr, 2);
 
-        assert!(matches!(
-            cmd.borrow().addr1.as_ref().unwrap().atype,
-            AddressType::Re
-        ));
-        if let AddressValue::Regex(Some(re)) = &cmd.borrow().addr1.as_ref().unwrap().value {
-            assert!(re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
-            assert!(!re.is_match(&mut IOChunk::new_from_str("bar")).unwrap());
-        } else {
-            panic!("expected a regex address");
+        match cmd.borrow().addr1.as_ref().unwrap() {
+            Address::Re(Some(re)) => {
+                assert!(re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
+                assert!(!re.is_match(&mut IOChunk::new_from_str("bar")).unwrap());
+            }
+            _ => panic!("expected regex address"),
         }
 
-        assert!(matches!(
-            cmd.borrow().addr2.as_ref().unwrap().atype,
-            AddressType::Re
-        ));
-        if let AddressValue::Regex(Some(re)) = &cmd.borrow().addr2.as_ref().unwrap().value {
-            assert!(re.is_match(&mut IOChunk::new_from_str("bar")).unwrap());
-            assert!(!re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
-        } else {
-            panic!("expected a regex address");
-        };
+        match cmd.borrow().addr2.as_ref().unwrap() {
+            Address::Re(Some(re)) => {
+                assert!(re.is_match(&mut IOChunk::new_from_str("bar")).unwrap());
+                assert!(!re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
+            }
+            _ => panic!("expected regex address"),
+        }
     }
 
     #[test]
@@ -1707,16 +1758,14 @@ mod tests {
         let n_addr = compile_address_range(&lines, &mut chars, &mut cmd, &ctx()).unwrap();
 
         assert_eq!(n_addr, 1);
-        assert!(matches!(
-            cmd.borrow().addr1.as_ref().unwrap().atype,
-            AddressType::Re
-        ));
-        if let AddressValue::Regex(Some(re)) = &cmd.borrow().addr1.as_ref().unwrap().value {
-            assert!(re.is_match(&mut IOChunk::new_from_str("FOO")).unwrap());
-            assert!(re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
-        } else {
-            panic!("expected a regex address with case-insensitive match");
-        };
+
+        match cmd.borrow().addr1.as_ref().unwrap() {
+            Address::Re(Some(re)) => {
+                assert!(re.is_match(&mut IOChunk::new_from_str("FOO")).unwrap());
+                assert!(re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
+            }
+            _ => panic!("expected regex address"),
+        }
     }
 
     // compile_sequence
@@ -1754,15 +1803,7 @@ mod tests {
         assert_eq!(cmd.code, 'q');
         assert!(!cmd.non_select);
 
-        let addr = cmd.addr1.as_ref().expect("addr1 should be set");
-        assert!(matches!(addr.atype, AddressType::Line));
-
-        let value = match &addr.value {
-            AddressValue::LineNumber(n) => *n,
-            _ => panic!(),
-        };
-        assert_eq!(value, 42);
-
+        assert!(matches!(cmd.addr1, Some(Address::Line(42))));
         assert!(cmd.next.is_none());
     }
 
@@ -1778,15 +1819,7 @@ mod tests {
         assert_eq!(cmd.code, 'p');
         assert!(cmd.non_select);
 
-        let addr = cmd.addr1.as_ref().expect("addr1 should be set");
-        assert!(matches!(addr.atype, AddressType::Line));
-
-        let value = match &addr.value {
-            AddressValue::LineNumber(n) => *n,
-            _ => panic!(),
-        };
-        assert_eq!(value, 42);
-
+        assert!(matches!(cmd.addr1, Some(Address::Line(42))));
         assert!(cmd.next.is_none());
     }
 
@@ -1834,14 +1867,7 @@ mod tests {
 
         assert_eq!(cmd.code, 'q');
 
-        let addr = cmd.addr1.as_ref().unwrap();
-        assert!(matches!(addr.atype, AddressType::Line));
-
-        let line = match &addr.value {
-            AddressValue::LineNumber(n) => *n,
-            _ => panic!(),
-        };
-        assert_eq!(line, 1);
+        assert!(matches!(cmd.addr1, Some(Address::Line(1))));
 
         assert_eq!(cmd.location.line_number, 1);
         assert_eq!(cmd.location.column_number, 1);
@@ -2459,6 +2485,114 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("duplicate label `dup'"));
+    }
+
+    // populate_range_commands
+    fn command_with_range(
+        code: char,
+        start: usize,
+        end: usize,
+        data: CommandData,
+    ) -> Rc<RefCell<Command>> {
+        Rc::new(RefCell::new(Command {
+            code,
+            addr1: Some(Address::Line(start)),
+            addr2: Some(Address::Line(end)),
+            data,
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn test_range_address() {
+        let cmd = command_with_range('p', 3, 5, CommandData::None);
+        let mut context = ProcessingContext::default();
+        assert_eq!(context.range_commands.len(), 0);
+
+        populate_range_commands(Some(cmd.clone()), &mut context);
+
+        assert_eq!(context.range_commands.len(), 1);
+
+        // Verify it is the same command
+        let rc = &context.range_commands[0];
+        assert!(Rc::ptr_eq(rc, &cmd));
+
+        // Verify addresses
+        let cmd_ref = rc.borrow();
+
+        assert!(matches!(cmd_ref.addr1, Some(Address::Line(3))));
+        assert!(matches!(cmd_ref.addr2, Some(Address::Line(5))));
+    }
+
+    #[test]
+    fn test_non_range_addresses_do_not_register() {
+        let mut context = ProcessingContext::default();
+
+        // Zero-address command
+        let cmd0 = Rc::new(RefCell::new(Command {
+            code: 'p',
+            data: CommandData::None,
+            ..Default::default()
+        }));
+
+        populate_range_commands(Some(cmd0), &mut context);
+        assert!(context.range_commands.is_empty());
+
+        // One-address command
+        let cmd1 = Rc::new(RefCell::new(Command {
+            code: 'p',
+            addr1: Some(Address::Line(3)),
+            data: CommandData::None,
+            ..Default::default()
+        }));
+
+        populate_range_commands(Some(cmd1), &mut context);
+        assert!(context.range_commands.is_empty());
+    }
+
+    #[test]
+    fn test_range_address_outside_and_inside_block() {
+        // Top-level range command: 1,2p
+        let outer = command_with_range('p', 1, 2, CommandData::None);
+
+        // Nested range command: 3,5p
+        let nested = command_with_range('p', 3, 5, CommandData::None);
+
+        // Block containing the nested range command
+        let block = command_with_data(CommandData::BranchTarget(Some(nested.clone())));
+
+        // Link outer -> block
+        outer.borrow_mut().next = Some(block);
+
+        let mut context = ProcessingContext::default();
+        assert_eq!(context.range_commands.len(), 0);
+
+        populate_range_commands(Some(outer.clone()), &mut context);
+
+        // Two range commands must be found.
+        assert_eq!(context.range_commands.len(), 2);
+
+        // Verify both commands are present (order-independent).
+        assert!(
+            context
+                .range_commands
+                .iter()
+                .any(|rc| Rc::ptr_eq(rc, &outer))
+        );
+        assert!(
+            context
+                .range_commands
+                .iter()
+                .any(|rc| Rc::ptr_eq(rc, &nested))
+        );
+
+        let nested_ref = nested.borrow();
+
+        let addr1 = nested_ref.addr1.as_ref().expect("nested addr1 missing");
+        assert!(matches!(addr1, Address::Line(3)));
+
+        let addr2 = nested_ref.addr2.as_ref().expect("nested addr2 missing");
+        assert!(matches!(addr2, Address::Line(5)));
     }
 
     // resolve_branch_targets
